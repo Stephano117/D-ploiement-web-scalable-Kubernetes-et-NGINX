@@ -1,0 +1,33 @@
+{
+  "name": "rgm",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "RGM - Real Ghetto Man : site d'écoute pour un studio",
+  "engines": {
+    "node": ">=22"
+  },
+  "workspaces": [
+    "client"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n api,site \"node --watch server/index.js\" \"npm run dev -w client\"",
+    "build": "npm run build -w client",
+    "start": "node server/index.js",
+    "prod": "npm run build && node server/index.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cookie-parser": "^1.4.7",
+    "dotenv": "^16.4.7",
+    "express": "^5.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^2.0.2",
+    "music-metadata": "^12.3.2",
+    "mysql2": "^3.11.5",
+    "sequelize": "^6.37.5"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  }
+}
