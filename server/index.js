@@ -1,10 +1,10 @@
 // RGM : serveur complet (Express + Sequelize + MySQL/MariaDB).
 //
 // Au démarrage, ce fichier :
-//   1. crée la base de données « rgm » si elle n'existe pas ;
+//   1. crée la base de données si DB_AUTO_CREATE n'est pas désactivé ;
 //   2. crée les tables automatiquement (Sequelize) ;
 //   3. crée ou met à jour le compte admin à partir du fichier .env.
-// Il n'y a donc rien à faire dans phpMyAdmin : il suffit que MySQL soit démarré dans XAMPP.
+// En hébergement managé, créer la base et désactiver DB_AUTO_CREATE.
 //
 // Sections : 1. Réglages · 2. Base de données · 3. Outils · 4. Routes publiques
 //            5. Routes admin · 6. Démarrage
@@ -13,6 +13,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { pipeline } from "node:stream/promises";
 import bcrypt from "bcryptjs";
 import cookieParser from "cookie-parser";
 import express from "express";
@@ -20,6 +21,7 @@ import jwt from "jsonwebtoken";
 import multer from "multer";
 import { parseFile } from "music-metadata";
 import mysql from "mysql2/promise";
+import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { DataTypes, Sequelize, col, fn } from "sequelize";
 
 // ============================================================ 1. RÉGLAGES
@@ -33,6 +35,8 @@ const cfg = {
     user: process.env.DB_USER || "root",
     password: process.env.DB_PASSWORD ?? "",
     name: process.env.DB_NAME || "rgm",
+    ssl: process.env.DB_SSL === "true",
+    autoCreate: process.env.DB_AUTO_CREATE !== "false",
   },
   secret: process.env.SECRET_KEY || "rgm-cle-de-developpement-a-changer",
   adminEmail: (process.env.ADMIN_EMAIL || "admin@rgm.local").toLowerCase(),
@@ -40,6 +44,23 @@ const cfg = {
   maxMb: Number(process.env.MAX_UPLOAD_MB) || 500,
   uploads: process.env.UPLOAD_DIR ? path.resolve(process.env.UPLOAD_DIR) : path.join(ROOT, "uploads"),
 };
+const r2Env = {
+  accountId: process.env.R2_ACCOUNT_ID,
+  bucket: process.env.R2_BUCKET,
+  accessKeyId: process.env.R2_ACCESS_KEY_ID,
+  secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
+};
+const r2Values = Object.values(r2Env);
+if (r2Values.some(Boolean) && !r2Values.every(Boolean)) {
+  throw new Error("R2 requiert R2_ACCOUNT_ID, R2_BUCKET, R2_ACCESS_KEY_ID et R2_SECRET_ACCESS_KEY.");
+}
+const r2 = r2Values.every(Boolean)
+  ? new S3Client({
+    region: "auto",
+    endpoint: `https://${r2Env.accountId}.r2.cloudflarestorage.com`,
+    credentials: { accessKeyId: r2Env.accessKeyId, secretAccessKey: r2Env.secretAccessKey },
+  })
+  : null;
 const AUDIO_EXT = new Set([".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg"]);
 const IMAGE_EXT = new Set([".jpg", ".jpeg", ".png", ".webp"]);
 const VISITOR_COOKIE = "rgm_visitor";
@@ -51,6 +72,7 @@ const sequelize = new Sequelize(cfg.db.name, cfg.db.user, cfg.db.password, {
   host: cfg.db.host,
   port: cfg.db.port,
   dialect: "mysql",
+  ...(cfg.db.ssl && { dialectOptions: { ssl: { minVersion: "TLSv1.2" } } }),
   logging: false,
   define: { charset: "utf8mb4", collate: "utf8mb4_unicode_ci" },
 });
@@ -86,10 +108,17 @@ Rating.belongsTo(Track, { foreignKey: "trackId" });
 
 async function ensureDatabase() {
   if (!/^\w+$/.test(cfg.db.name)) throw new Error("DB_NAME ne peut contenir que des lettres, chiffres et _.");
+  if (!cfg.db.autoCreate) return;
   const { host, port, user, password, name } = cfg.db;
-  const conn = await mysql.createConnection({ host, port, user, password });
-  await conn.query(`CREATE DATABASE IF NOT EXISTS \`${name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`);
-  await conn.end();
+  const conn = await mysql.createConnection({
+    host, port, user, password,
+    ...(cfg.db.ssl && { ssl: { minVersion: "TLSv1.2" } }),
+  });
+  try {
+    await conn.query(`CREATE DATABASE IF NOT EXISTS \`${name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`);
+  } finally {
+    await conn.end();
+  }
 }
 
 async function ensureAdmin() {
@@ -135,8 +164,57 @@ async function serialize(tracks, visitorId) {
 
 const newest = [["createdAt", "DESC"], ["id", "DESC"]];
 const fail = (res, status, detail) => res.status(status).json({ detail });
-const removeFile = (sub, name) => name && fs.promises.rm(path.join(cfg.uploads, sub, path.basename(name)), { force: true });
 const randomName = (ext) => crypto.randomUUID().replaceAll("-", "") + ext;
+async function storeObject(sub, name, body, contentType, contentLength) {
+  if (r2) {
+    await r2.send(new PutObjectCommand({
+      Bucket: r2Env.bucket,
+      Key: `${sub}/${name}`,
+      Body: body,
+      ContentType: contentType,
+      ContentLength: contentLength,
+    }));
+  } else if (Buffer.isBuffer(body)) {
+    await fs.promises.writeFile(path.join(cfg.uploads, sub, name), body);
+  }
+}
+
+async function removeFile(sub, name) {
+  if (!name) return;
+  if (r2) {
+    await r2.send(new DeleteObjectCommand({ Bucket: r2Env.bucket, Key: `${sub}/${name}` }));
+    return;
+  }
+  await fs.promises.rm(path.join(cfg.uploads, sub, path.basename(name)), { force: true });
+}
+
+async function serveStoredObject(req, res, sub) {
+  const name = req.params.name;
+  if (!/^[a-f0-9]{32}\.[a-z0-9]+$/i.test(name)) return fail(res, 404, "Fichier introuvable.");
+  try {
+    const result = await r2.send(new GetObjectCommand({
+      Bucket: r2Env.bucket,
+      Key: `${sub}/${name}`,
+      ...(req.headers.range && { Range: req.headers.range }),
+    }));
+    res.set("Cache-Control", "public, max-age=3600");
+    res.set("Accept-Ranges", "bytes");
+    if (result.ContentType) res.set("Content-Type", result.ContentType);
+    if (result.ContentLength !== undefined) res.set("Content-Length", String(result.ContentLength));
+    if (result.ContentRange) {
+      res.status(206);
+      res.set("Content-Range", result.ContentRange);
+    }
+    if (!result.Body) throw new Error("R2 a renvoyé un objet sans contenu.");
+    await pipeline(result.Body, res);
+  } catch (err) {
+    if (err.name === "NoSuchKey" || err.$metadata?.httpStatusCode === 404) {
+      return fail(res, 404, "Fichier introuvable.");
+    }
+    if (err.$metadata?.httpStatusCode === 416) return fail(res, 416, "Plage de lecture invalide.");
+    throw err;
+  }
+}
 
 /** Limite le nombre de requêtes par adresse IP (protège les notes contre les abus). */
 function limiter(max, windowMs) {
@@ -177,8 +255,13 @@ const app = express();
 app.set("trust proxy", true);
 app.use(express.json());
 app.use(cookieParser());
-app.use("/media/audio", express.static(path.join(cfg.uploads, "audio")));   // lecture avec avance rapide (Range)
-app.use("/media/covers", express.static(path.join(cfg.uploads, "covers")));
+if (r2) {
+  app.get("/media/audio/:name", (req, res) => serveStoredObject(req, res, "audio"));
+  app.get("/media/covers/:name", (req, res) => serveStoredObject(req, res, "covers"));
+} else {
+  app.use("/media/audio", express.static(path.join(cfg.uploads, "audio")));
+  app.use("/media/covers", express.static(path.join(cfg.uploads, "covers")));
+}
 
 // ============================================================ 4. ROUTES PUBLIQUES
 app.get("/api/health", (req, res) => res.json({ status: "ok" }));
@@ -259,23 +342,36 @@ app.post("/api/admin/tracks", requireAdmin, audioUpload.array("files", 50), asyn
   const errors = [...(req.rejected || [])];
   for (const file of req.files || []) {
     const shown = file.originalname;
+    let meta;
     try {
-      const meta = await parseFile(file.path, { duration: true });
+      meta = await parseFile(file.path, { duration: true });
       if (!meta.format.duration) throw new Error("pas de durée : ce n'est pas un vrai fichier audio");
+    } catch {
+      if (r2) await fs.promises.rm(file.path, { force: true });
+      else await removeFile("audio", file.filename);
+      errors.push({ file: shown, error: "Fichier audio illisible ou corrompu." });
+      continue;
+    }
+
+    let coverFile = null;
+    try {
+      await storeObject("audio", file.filename, fs.createReadStream(file.path), file.mimetype, file.size);
       const picture = meta.common.picture?.[0];
-      let coverFile = null;
       if (picture) {
         coverFile = randomName(picture.format.includes("png") ? ".png" : ".jpg");
-        await fs.promises.writeFile(path.join(cfg.uploads, "covers", coverFile), picture.data);
+        await storeObject("covers", coverFile, picture.data, picture.format, picture.data.length);
       }
       created.push(await Track.create({
         title: (meta.common.title || path.parse(shown).name.replace(/_/g, " ")).trim().slice(0, 200),
         album: (meta.common.album || "").slice(0, 200),
         audioFile: file.filename, coverFile, duration: meta.format.duration || 0,
       }));
-    } catch {
+    } catch (err) {
       await removeFile("audio", file.filename);
-      errors.push({ file: shown, error: "Fichier audio illisible ou corrompu." });
+      if (coverFile) await removeFile("covers", coverFile);
+      throw err;
+    } finally {
+      if (r2) await fs.promises.rm(file.path, { force: true });
     }
   }
   res.json({ created: await serialize(created, null), errors });
@@ -301,9 +397,22 @@ app.patch("/api/admin/tracks/:id", requireAdmin, async (req, res) => {
 app.post("/api/admin/tracks/:id/cover", requireAdmin, coverUpload.single("file"), async (req, res) => {
   if (!req.file) return fail(res, 400, req.rejected?.[0]?.error || "Aucune image reçue.");
   const track = await Track.findByPk(req.params.id);
-  if (!track) { await removeFile("covers", req.file.filename); return fail(res, 404, "Titre introuvable."); }
-  await removeFile("covers", track.coverFile);
-  await track.update({ coverFile: req.file.filename });
+  if (!track) {
+    if (r2) await fs.promises.rm(req.file.path, { force: true });
+    else await removeFile("covers", req.file.filename);
+    return fail(res, 404, "Titre introuvable.");
+  }
+  const previousCover = track.coverFile;
+  try {
+    await storeObject("covers", req.file.filename, fs.createReadStream(req.file.path), req.file.mimetype, req.file.size);
+    await track.update({ coverFile: req.file.filename });
+  } catch (err) {
+    await removeFile("covers", req.file.filename);
+    throw err;
+  } finally {
+    if (r2) await fs.promises.rm(req.file.path, { force: true });
+  }
+  await removeFile("covers", previousCover);
   res.json((await serialize([track], null))[0]);
 });
 
@@ -329,6 +438,7 @@ app.use((err, req, res, next) => {
     return err.code === "LIMIT_FILE_SIZE" ? fail(res, 413, "Fichier trop lourd.") : fail(res, 400, "Envoi impossible.");
   }
   console.error(err);
+  if (res.headersSent) return next(err);
   fail(res, 500, "Erreur du serveur.");
 });
 
@@ -345,8 +455,8 @@ async function start() {
 
 start().catch((err) => {
   const messages = {
-    ECONNREFUSED: `Impossible de joindre MySQL (${cfg.db.host}:${cfg.db.port}). Ouvrez XAMPP et cliquez sur « Start » à côté de MySQL, puis relancez.`,
-    ER_ACCESS_DENIED_ERROR: "MySQL refuse la connexion. Vérifiez DB_USER et DB_PASSWORD dans le fichier .env.",
+    ECONNREFUSED: `Impossible de joindre MySQL (${cfg.db.host}:${cfg.db.port}). Vérifiez l'hôte, le port et la disponibilité du service de base de données.`,
+    ER_ACCESS_DENIED_ERROR: "MySQL refuse la connexion. Vérifiez DB_USER et DB_PASSWORD dans les variables d'environnement.",
   };
   console.error("\n" + (messages[err.code] || messages[err.parent?.code] || err.stack || err));
   process.exit(1);

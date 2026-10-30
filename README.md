@@ -225,21 +225,90 @@ npm run prod
 L'application sera sur http://localhost:3000. Pour les démarrages suivants sans recompiler :
 `npm start`.
 
-Sans configuration personnalisée, le compte de démonstration est `admin@rgm.local` /
+Sans configuration personnalisée, le compte de démonstration local est `admin@rgm.local` /
 `rgm2026`. Ne pas utiliser ces valeurs en production.
+
+## Hébergement gratuit pour une démonstration
+
+Le projet peut être déployé sans Docker sur Render avec une base MySQL compatible et un
+stockage Cloudflare R2. Cette configuration est destinée à une démonstration, pas à une
+application de production : l'offre gratuite Render peut endormir le serveur après une période
+d'inactivité, et le premier chargement peut alors être lent. Les quotas et conditions des offres
+gratuites peuvent changer.
+
+### 1. Préparer la base TiDB Cloud
+
+Créer une instance TiDB Cloud Starter et une base de données. Récupérer l'hôte, le port, le nom
+d'utilisateur et le mot de passe de connexion. L'application doit utiliser l'endpoint public
+avec TLS. Créer la base avant le premier démarrage : en hébergement managé, l'application ne
+tente pas de créer une base avec le compte applicatif.
+
+### 2. Préparer le stockage Cloudflare R2
+
+Créer un bucket R2 privé et une clé API limitée à ce bucket avec les droits de lecture et
+d'écriture d'objets. Conserver l'identifiant du compte, le nom du bucket, l'identifiant de clé et
+le secret de clé. Le bucket reste privé : les fichiers audio et pochettes sont servis par le
+serveur de l'application, ce qui évite d'exposer les identifiants R2 au navigateur.
+
+### 3. Créer le service Render
+
+Connecter le dépôt GitHub à un nouveau **Web Service** Render, avec la branche `main` :
+
+- **Build Command** : `npm ci && npm run build`
+- **Start Command** : `npm start`
+- **Node version** : `22` (variable `NODE_VERSION`).
+
+Dans **Environment**, ajouter ces variables depuis les tableaux de bord des fournisseurs :
+
+```text
+PORT=3000
+DB_HOST=<hôte TiDB>
+DB_PORT=<port TiDB>
+DB_USER=<utilisateur TiDB>
+DB_PASSWORD=<mot de passe TiDB>
+DB_NAME=<base créée dans TiDB>
+DB_SSL=true
+DB_AUTO_CREATE=false
+ADMIN_EMAIL=<adresse du compte studio>
+ADMIN_PASSWORD=<mot de passe fort et unique>
+SECRET_KEY=<valeur aléatoire longue>
+R2_ACCOUNT_ID=<identifiant du compte Cloudflare>
+R2_BUCKET=<nom du bucket>
+R2_ACCESS_KEY_ID=<identifiant de la clé R2>
+R2_SECRET_ACCESS_KEY=<secret de la clé R2>
+MAX_UPLOAD_MB=50
+```
+
+Ne pas mettre de vraies valeurs dans GitHub, le README ou les messages de groupe. Render doit
+construire puis démarrer le service ; son URL `onrender.com` sert le site et l'API sur la même
+adresse. Après le premier déploiement, vérifier `/api/health`, l'accès à `/admin`, l'import et la
+lecture d'un petit fichier audio, puis consulter les journaux Render si une étape échoue.
+
+Le mode local reste inchangé : sans les quatre variables `R2_*`, les imports sont enregistrés
+dans `uploads/`. En hébergement, configure les quatre variables R2 ensemble ; une configuration
+partielle est refusée au démarrage. `DB_SSL=true` active TLS MySQL, et `DB_AUTO_CREATE=false`
+empêche l'application de tenter de créer la base distante. Les tables et le compte studio sont
+toujours initialisés au démarrage.
+
+Le service gratuit Render utilise un disque temporaire. Avec R2 configuré, les imports audio et
+les pochettes restent dans le bucket après redémarrage ; les fichiers temporaires d'un import
+restent locaux le temps de la requête. La base et le bucket ont leurs propres quotas : surveiller
+leur consommation et conserver une sauvegarde des données importantes.
 
 ## Configuration et données
 
-- `.env.example` documente la configuration du lancement local avec XAMPP.
+- `.env.example` documente le lancement local avec XAMPP et les variables facultatives pour
+  l'hébergement distant.
 - `.env.docker.example` documente la configuration Docker ; la copier en `.env.docker` et
   modifier les secrets avant le lancement.
 - `ADMIN_EMAIL` et `ADMIN_PASSWORD` configurent le compte studio. Le compte est créé ou mis à
   jour au démarrage du serveur à partir de ces valeurs.
 - `SECRET_KEY` signe les jetons de connexion ; choisir une longue valeur aléatoire.
-- Les fichiers audio et pochettes importés sont stockés sous `uploads/` hors Docker, ou dans le
-  volume `rgm_uploads` avec Docker.
-- Pour conserver des données de production, sauvegarder la base MySQL et les fichiers importés.
-  Les volumes Docker ne remplacent pas une sauvegarde externe.
+- Les fichiers audio et pochettes importés sont stockés sous `uploads/` hors Docker, dans le
+  volume `rgm_uploads` avec Docker, ou dans le bucket R2 lorsque les variables `R2_*` sont
+  configurées.
+- Pour conserver des données importantes, sauvegarder la base et les fichiers importés. Les
+  volumes Docker et les offres gratuites ne remplacent pas une sauvegarde externe.
 
 Les images de l'application sont conçues pour Linux (`node:22-bookworm-slim`). Docker Desktop
 fournit l'environnement nécessaire sous Windows.
@@ -259,7 +328,7 @@ Dockerfile                 construction de l'image de l'application
 compose.yaml               application, MySQL et volumes Docker
 .dockerignore              fichiers exclus du contexte de construction
 .env.docker.example        exemple de configuration Docker sans secrets réels
-.env.example               exemple de configuration XAMPP
+.env.example               exemple local et variables optionnelles d'hébergement
 server/index.js            serveur, base de données, routes et import audio
 client/                    application React et client compilé pour la production
 uploads/                   fichiers audio et pochettes en développement local
