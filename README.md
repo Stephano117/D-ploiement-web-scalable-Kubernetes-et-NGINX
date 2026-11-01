@@ -75,8 +75,19 @@ des secrets uniques, jamais le mot de passe local `rgm2026`.
 
 Le mode `FILE_STORAGE=database` conserve les médias dans TiDB après un redémarrage de Render.
 Pour garder la démonstration dans les limites du forfait, les imports sont limités à 20 Mo par
-fichier avec `MAX_UPLOAD_MB=20`. Cela augmente l'espace et les opérations utilisés sur la base.
-Le mode local par défaut (`FILE_STORAGE=local`) reste adapté au développement avec XAMPP.
+fichier avec `MAX_UPLOAD_MB=20`. Le forfait Starter MySQL-compatible inclut 5 Gio de stockage ;
+l'application affiche l'espace occupé par les fichiers dans `/admin`, avertit quand il approche de
+4 Gio et refuse un nouvel import qui dépasserait cette réserve. Les 1 Gio restants sont réservés
+aux tables et aux autres données de la base. TiDB reste la référence pour le quota réel.
+
+Aucun morceau ni fichier média n'est supprimé automatiquement pour libérer de l'espace. L'interface
+d'administration ne propose pas de suppression de titres ; remplacer une pochette conserve aussi
+l'ancienne image dans la base. Quand la réserve est atteinte, les nouveaux imports sont refusés et
+les morceaux déjà stockés restent en place. Les données et les quotas des fournisseurs peuvent
+évoluer : surveiller également l'utilisation affichée dans TiDB Cloud.
+
+Le stockage des morceaux et des pochettes utilise les opérations et l'espace du quota TiDB. Le mode
+local par défaut (`FILE_STORAGE=local`) reste adapté au développement avec XAMPP.
 
 L'offre gratuite convient à une démo : le service Render peut s'endormir après une période
 d'inactivité, et le premier chargement peut être lent. Surveiller les limites des offres.

@@ -59,6 +59,7 @@ const sequelize = new Sequelize(cfg.db.name, cfg.db.user, cfg.db.password, {
   define: { charset: "utf8mb4", collate: "utf8mb4_unicode_ci" },
 });
 const { STRING, FLOAT, INTEGER, BOOLEAN } = DataTypes;
+const MEDIA_STORAGE_LIMIT_BYTES = 4 * 1024 ** 3;
 
 /** Compte unique du studio. Son email et son mot de passe viennent toujours du .env. */
 const Admin = sequelize.define("Admin", {
@@ -156,9 +157,9 @@ const randomName = (ext) => crypto.randomUUID().replaceAll("-", "") + ext;
 async function storeObject(sub, name, source, contentType) {
   if (cfg.db.fileStorage) {
     const data = typeof source === "string" ? await fs.promises.readFile(source) : Buffer.from(source);
-    await MediaFile.upsert({ objectKey: `${sub}/${name}`, contentType, data });
+    await MediaFile.create({ objectKey: `${sub}/${name}`, contentType, data });
   } else if (typeof source !== "string") {
-    await fs.promises.writeFile(path.join(cfg.uploads, sub, name), Buffer.from(source));
+    await fs.promises.writeFile(path.join(cfg.uploads, sub, name), Buffer.from(source), { flag: "wx" });
   }
 }
 
@@ -169,6 +170,14 @@ async function removeFile(sub, name) {
     return;
   }
   await fs.promises.rm(path.join(cfg.uploads, sub, path.basename(name)), { force: true });
+}
+
+async function getMediaStorageBytes() {
+  const [usage] = await sequelize.query(
+    "SELECT COALESCE(SUM(OCTET_LENGTH(data)), 0) AS usedBytes FROM media_files",
+    { type: Sequelize.QueryTypes.SELECT },
+  );
+  return Number(usage.usedBytes) || 0;
 }
 
 async function serveStoredObject(req, res, sub) {
@@ -329,6 +338,19 @@ app.get("/api/admin/tracks", requireAdmin, async (req, res) => {
   res.json(await serialize(await Track.findAll({ order: newest }), null));
 });
 
+app.get("/api/admin/storage", requireAdmin, async (req, res) => {
+  if (!cfg.db.fileStorage) return res.json({ tracked: false });
+  const usedBytes = await getMediaStorageBytes();
+  const warningBytes = MEDIA_STORAGE_LIMIT_BYTES * 0.7;
+  res.json({
+    tracked: true,
+    usedBytes,
+    limitBytes: MEDIA_STORAGE_LIMIT_BYTES,
+    warning: usedBytes >= warningBytes,
+    importBlocked: usedBytes >= MEDIA_STORAGE_LIMIT_BYTES,
+  });
+});
+
 /** Importe un ou plusieurs fichiers audio. Titre, album, pochette et durée sont lus dans le fichier. */
 app.post("/api/admin/tracks", requireAdmin, audioUpload.array("files", 50), async (req, res) => {
   const created = [];
@@ -347,12 +369,25 @@ app.post("/api/admin/tracks", requireAdmin, audioUpload.array("files", 50), asyn
     }
 
     let coverFile = null;
+    let audioStored = false;
+    let coverStored = false;
+    const picture = meta.common.picture?.[0];
+    if (cfg.db.fileStorage) {
+      const usedBytes = await getMediaStorageBytes();
+      const pendingBytes = file.size + (picture?.data.byteLength || 0);
+      if (usedBytes + pendingBytes > MEDIA_STORAGE_LIMIT_BYTES) {
+        await fs.promises.rm(file.path, { force: true });
+        errors.push({ file: shown, error: "Espace médias insuffisant. Ce fichier n'a pas été importé ; les morceaux déjà enregistrés sont conservés." });
+        continue;
+      }
+    }
     try {
       await storeObject("audio", file.filename, file.path, file.mimetype);
-      const picture = meta.common.picture?.[0];
+      audioStored = true;
       if (picture) {
         coverFile = randomName(picture.format.includes("png") ? ".png" : ".jpg");
         await storeObject("covers", coverFile, picture.data, picture.format);
+        coverStored = true;
       }
       created.push(await Track.create({
         title: (meta.common.title || path.parse(shown).name.replace(/_/g, " ")).trim().slice(0, 200),
@@ -360,8 +395,8 @@ app.post("/api/admin/tracks", requireAdmin, audioUpload.array("files", 50), asyn
         audioFile: file.filename, coverFile, duration: meta.format.duration || 0,
       }));
     } catch (err) {
-      await removeFile("audio", file.filename);
-      if (coverFile) await removeFile("covers", coverFile);
+      if (audioStored) await removeFile("audio", file.filename);
+      if (coverStored && coverFile) await removeFile("covers", coverFile);
       throw err;
     } finally {
       if (cfg.db.fileStorage) await fs.promises.rm(file.path, { force: true });
@@ -395,28 +430,18 @@ app.post("/api/admin/tracks/:id/cover", requireAdmin, coverUpload.single("file")
     else await removeFile("covers", req.file.filename);
     return fail(res, 404, "Titre introuvable.");
   }
-  const previousCover = track.coverFile;
+  let coverStored = false;
   try {
     await storeObject("covers", req.file.filename, req.file.path, req.file.mimetype);
+    coverStored = true;
     await track.update({ coverFile: req.file.filename });
   } catch (err) {
-    await removeFile("covers", req.file.filename);
+    if (coverStored) await removeFile("covers", req.file.filename);
     throw err;
   } finally {
     if (cfg.db.fileStorage) await fs.promises.rm(req.file.path, { force: true });
   }
-  await removeFile("covers", previousCover);
   res.json((await serialize([track], null))[0]);
-});
-
-app.delete("/api/admin/tracks/:id", requireAdmin, async (req, res) => {
-  const track = await Track.findByPk(req.params.id);
-  if (!track) return fail(res, 404, "Titre introuvable.");
-  await Rating.destroy({ where: { trackId: track.id } });
-  await track.destroy();
-  await removeFile("audio", track.audioFile);
-  await removeFile("covers", track.coverFile);
-  res.json({ deleted: track.id });
 });
 
 // Site compilé (npm run build) : servi par ce même serveur, pour tout ce qui n'est pas /api ou /media.
@@ -432,6 +457,9 @@ app.use((err, req, res, next) => {
   }
   console.error(err);
   if (res.headersSent) return next(err);
+  if (["ER_DISK_FULL", "ER_RECORD_FILE_FULL"].includes(err.code || err.parent?.code)) {
+    return fail(res, 507, "Le stockage TiDB est plein. Aucun morceau existant n'a été supprimé. Vérifiez l'espace disponible avant de réessayer.");
+  }
   fail(res, 500, "Erreur du serveur.");
 });
 

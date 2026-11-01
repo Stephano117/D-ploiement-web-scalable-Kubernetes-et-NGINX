@@ -38,8 +38,8 @@ export const api = {
     setToken(data.access_token);
   },
   adminTracks: () => request("/api/admin/tracks", {}, true),
+  adminStorage: () => request("/api/admin/storage", {}, true),
   update: (id, patch) => request(`/api/admin/tracks/${id}`, json("PATCH", patch), true),
-  remove: (id) => request(`/api/admin/tracks/${id}`, { method: "DELETE" }, true),
   cover(id, file) {
     const body = new FormData();
     body.append("file", file);

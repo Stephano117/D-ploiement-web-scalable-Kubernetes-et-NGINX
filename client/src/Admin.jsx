@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, getToken, setToken } from "./api.js";
 
 const fmt = (s) => `${Math.floor((s || 0) / 60)}:${String(Math.floor((s || 0) % 60)).padStart(2, "0")}`;
+const fmtBytes = (bytes) => `${(bytes / 1024 ** 3).toFixed(2)} Gio`;
 
 // ======================================================= Connexion
 function Login({ onDone }) {
@@ -42,11 +43,10 @@ function Login({ onDone }) {
 }
 
 // ======================================================= Ligne d'un titre
-function TrackRow({ track, onChange, onDeleted, onError }) {
+function TrackRow({ track, onChange, onError }) {
   const [title, setTitle] = useState(track.title);
   const [album, setAlbum] = useState(track.album);
   const [published, setPublished] = useState(track.published);
-  const [confirm, setConfirm] = useState(false);
   const coverInput = useRef(null);
 
   useEffect(() => setPublished(track.published), [track.published]);
@@ -58,10 +58,6 @@ function TrackRow({ track, onChange, onDeleted, onError }) {
     if (!file) return;
     try { onChange(await api.cover(track.id, file)); } catch (e) { onError(e); }
   }
-  async function remove() {
-    try { await api.remove(track.id); onDeleted(track.id); } catch (e) { onError(e); }
-  }
-
   return (
     <li className="arow">
       <button className="coverbtn" onClick={() => coverInput.current.click()} title="Changer la pochette" aria-label="Changer la pochette">
@@ -84,14 +80,6 @@ function TrackRow({ track, onChange, onDeleted, onError }) {
           onChange={(e) => { setPublished(e.target.checked); save({ published: e.target.checked }); }} />
         <span>{published ? "Publié" : "Brouillon"}</span>
       </label>
-      {confirm ? (
-        <span className="confirm">
-          <button className="btn danger" onClick={remove}>Confirmer</button>
-          <button className="btn" onClick={() => setConfirm(false)}>Annuler</button>
-        </span>
-      ) : (
-        <button className="btn" onClick={() => setConfirm(true)}>Supprimer</button>
-      )}
     </li>
   );
 }
@@ -100,6 +88,7 @@ function TrackRow({ track, onChange, onDeleted, onError }) {
 export default function Admin() {
   const [logged, setLogged] = useState(Boolean(getToken()));
   const [tracks, setTracks] = useState(null);
+  const [storage, setStorage] = useState(null);
   const [message, setMessage] = useState(null);   // { text, ok }
   const [progress, setProgress] = useState(null);   // null = pas d'envoi en cours
   const [over, setOver] = useState(false);
@@ -110,6 +99,7 @@ export default function Admin() {
 
   const load = useCallback(() => {
     api.adminTracks().then(setTracks).catch(fail);
+    api.adminStorage().then(setStorage).catch(fail);
   }, [fail]);
 
   useEffect(() => { if (logged) load(); }, [logged, load]);
@@ -162,6 +152,15 @@ export default function Admin() {
           )}
         </label>
 
+        {storage?.tracked && (
+          <p className={`notice ${storage.warning ? "" : "ok"}`} role={storage.warning ? "alert" : "status"}>
+            Stockage des morceaux : {fmtBytes(storage.usedBytes)} utilisés sur {fmtBytes(storage.limitBytes)}.
+            {storage.warning
+              ? " L'espace commence à se remplir. Aucun morceau ne sera supprimé automatiquement ; les nouveaux imports seront refusés si l'espace réservé est atteint."
+              : " Les morceaux importés sont conservés ; aucun nettoyage automatique n'est effectué."}
+          </p>
+        )}
+
         {message && <p className={`notice ${message.ok ? "ok" : ""}`} role="status">{message.text}</p>}
 
         <h2>Vos titres {tracks && <small>{tracks.length}</small>}</h2>
@@ -172,7 +171,6 @@ export default function Admin() {
             <TrackRow
               key={t.id} track={t} onError={fail}
               onChange={(u) => setTracks((all) => all.map((x) => (x.id === u.id ? u : x)))}
-              onDeleted={(id) => setTracks((all) => all.filter((x) => x.id !== id))}
             />
           ))}
         </ul>
