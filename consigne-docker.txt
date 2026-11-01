@@ -1,0 +1,73 @@
+CONSIGNE POUR LA PARTIE DOCKER
+
+Objectif
+Construire l’image Docker de l’application RGM et la publier dans un registre afin que le
+responsable Kubernetes puisse la récupérer. Le code est déjà sur GitHub ; l’image Docker,
+elle, n’a pas encore été construite ni publiée.
+
+Prérequis
+- Un ordinateur où Docker fonctionne (Docker Desktop doit être démarré sous Windows).
+- Git et un compte GitHub autorisé à publier une image sur GHCR.
+
+1. Récupérer le projet
+Ouvrir un terminal et exécuter :
+
+git clone https://github.com/Stephano117/D-ploiement-web-scalable-Kubernetes-et-NGINX.git
+cd D-ploiement-web-scalable-Kubernetes-et-NGINX
+
+2. Vérifier Docker
+Depuis le terminal, vérifier que le moteur Docker répond :
+
+docker --version
+docker info
+
+Si « docker info » indique que le moteur ne répond pas, démarrer Docker Desktop puis réessayer.
+
+3. Construire et vérifier l’image
+Depuis la racine du projet, dans le dossier contenant le Dockerfile, exécuter :
+
+docker build --pull -t rgm-app:1.0.0 .
+docker image inspect rgm-app:1.0.0
+
+La construction compile le site React et l’intègre au serveur Node.js. « 1.0.0 » est un tag
+d’exemple : utilisez le tag convenu avec le groupe et gardez-le identique dans les étapes suivantes.
+
+4. Publier l’image sur GitHub Container Registry (GHCR)
+L’image locale n’est pas encore accessible à Kubernetes. Pour la publier, connecter Docker à GHCR :
+
+docker login ghcr.io --username VOTRE_NOM_GITHUB
+
+Quand Docker demande le mot de passe, saisir un jeton GitHub autorisé à publier des packages
+(permission write:packages). Ne jamais mettre ce jeton dans le dépôt, le Dockerfile ou un message
+partagé.
+
+Remplacer « votre-nom-github » par le propriétaire du package en minuscules et « 1.0.0 » par le
+tag convenu, puis exécuter :
+
+docker tag rgm-app:1.0.0 ghcr.io/votre-nom-github/rgm:1.0.0
+docker push ghcr.io/votre-nom-github/rgm:1.0.0
+
+Vérifier sur GitHub que le package RGM a bien été créé et que le tag publié est correct. Vérifier
+également sa visibilité : si le package est privé, le responsable Kubernetes devra configurer un
+secret imagePullSecret pour permettre au cluster de le télécharger.
+
+5. Transmettre au responsable Kubernetes
+Envoyer au groupe :
+- l’adresse complète de l’image publiée, par exemple ghcr.io/votre-nom-github/rgm:1.0.0 ;
+- le tag utilisé et la confirmation que le push a réussi ;
+- préciser si le package est public ou privé ;
+- indiquer les variables à configurer pour l’application : PORT (3000), DB_HOST, DB_PORT,
+  DB_USER, DB_PASSWORD, DB_NAME, ADMIN_EMAIL, ADMIN_PASSWORD et SECRET_KEY.
+
+Les mots de passe et SECRET_KEY doivent être configurés comme secrets dans Kubernetes. Ne pas
+les intégrer à l’image ni les publier dans GitHub.
+
+À savoir pour le déploiement
+- L’image contient le serveur Node.js, le client React compilé et les dépendances de production.
+- Elle ne contient pas MySQL, les secrets, ni les morceaux audio et pochettes importés.
+- Le responsable Kubernetes doit prévoir séparément la base MySQL et le stockage persistant des
+  imports (UPLOAD_DIR, actuellement /app/uploads).
+- compose.yaml sert au lancement local de l’application avec MySQL ; il ne déploie pas
+  l’application dans Kubernetes.
+- La construction et la publication peuvent être faites sur l’ordinateur d’un collègue équipé de
+  Docker. Docker Desktop n’a pas besoin d’être lancé sur le PC de la personne qui prépare le code.

@@ -13,7 +13,6 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { pipeline } from "node:stream/promises";
 import bcrypt from "bcryptjs";
 import cookieParser from "cookie-parser";
 import express from "express";
@@ -21,7 +20,6 @@ import jwt from "jsonwebtoken";
 import multer from "multer";
 import { parseFile } from "music-metadata";
 import mysql from "mysql2/promise";
-import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { DataTypes, Sequelize, col, fn } from "sequelize";
 
 // ============================================================ 1. RÉGLAGES
@@ -37,6 +35,7 @@ const cfg = {
     name: process.env.DB_NAME || "rgm",
     ssl: process.env.DB_SSL === "true",
     autoCreate: process.env.DB_AUTO_CREATE !== "false",
+    fileStorage: process.env.FILE_STORAGE === "database",
   },
   secret: process.env.SECRET_KEY || "rgm-cle-de-developpement-a-changer",
   adminEmail: (process.env.ADMIN_EMAIL || "admin@rgm.local").toLowerCase(),
@@ -44,23 +43,6 @@ const cfg = {
   maxMb: Number(process.env.MAX_UPLOAD_MB) || 500,
   uploads: process.env.UPLOAD_DIR ? path.resolve(process.env.UPLOAD_DIR) : path.join(ROOT, "uploads"),
 };
-const r2Env = {
-  accountId: process.env.R2_ACCOUNT_ID,
-  bucket: process.env.R2_BUCKET,
-  accessKeyId: process.env.R2_ACCESS_KEY_ID,
-  secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
-};
-const r2Values = Object.values(r2Env);
-if (r2Values.some(Boolean) && !r2Values.every(Boolean)) {
-  throw new Error("R2 requiert R2_ACCOUNT_ID, R2_BUCKET, R2_ACCESS_KEY_ID et R2_SECRET_ACCESS_KEY.");
-}
-const r2 = r2Values.every(Boolean)
-  ? new S3Client({
-    region: "auto",
-    endpoint: `https://${r2Env.accountId}.r2.cloudflarestorage.com`,
-    credentials: { accessKeyId: r2Env.accessKeyId, secretAccessKey: r2Env.secretAccessKey },
-  })
-  : null;
 const AUDIO_EXT = new Set([".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg"]);
 const IMAGE_EXT = new Set([".jpg", ".jpeg", ".png", ".webp"]);
 const VISITOR_COOKIE = "rgm_visitor";
@@ -102,6 +84,12 @@ const Rating = sequelize.define("Rating", {
   visitorId: { type: STRING(64), allowNull: false },
   value: { type: INTEGER, allowNull: false },
 }, { tableName: "ratings", timestamps: false, indexes: [{ unique: true, fields: ["trackId", "visitorId"] }] });
+
+const MediaFile = sequelize.define("MediaFile", {
+  objectKey: { type: STRING(300), primaryKey: true },
+  contentType: { type: STRING(100), allowNull: false },
+  data: { type: DataTypes.BLOB("long"), allowNull: false },
+}, { tableName: "media_files", timestamps: false });
 
 Track.hasMany(Rating, { foreignKey: "trackId", onDelete: "CASCADE" });
 Rating.belongsTo(Track, { foreignKey: "trackId" });
@@ -165,24 +153,19 @@ async function serialize(tracks, visitorId) {
 const newest = [["createdAt", "DESC"], ["id", "DESC"]];
 const fail = (res, status, detail) => res.status(status).json({ detail });
 const randomName = (ext) => crypto.randomUUID().replaceAll("-", "") + ext;
-async function storeObject(sub, name, body, contentType, contentLength) {
-  if (r2) {
-    await r2.send(new PutObjectCommand({
-      Bucket: r2Env.bucket,
-      Key: `${sub}/${name}`,
-      Body: body,
-      ContentType: contentType,
-      ContentLength: contentLength,
-    }));
-  } else if (Buffer.isBuffer(body)) {
-    await fs.promises.writeFile(path.join(cfg.uploads, sub, name), body);
+async function storeObject(sub, name, source, contentType) {
+  if (cfg.db.fileStorage) {
+    const data = Buffer.isBuffer(source) ? source : await fs.promises.readFile(source);
+    await MediaFile.upsert({ objectKey: `${sub}/${name}`, contentType, data });
+  } else if (Buffer.isBuffer(source)) {
+    await fs.promises.writeFile(path.join(cfg.uploads, sub, name), source);
   }
 }
 
 async function removeFile(sub, name) {
   if (!name) return;
-  if (r2) {
-    await r2.send(new DeleteObjectCommand({ Bucket: r2Env.bucket, Key: `${sub}/${name}` }));
+  if (cfg.db.fileStorage) {
+    await MediaFile.destroy({ where: { objectKey: `${sub}/${name}` } });
     return;
   }
   await fs.promises.rm(path.join(cfg.uploads, sub, path.basename(name)), { force: true });
@@ -191,29 +174,39 @@ async function removeFile(sub, name) {
 async function serveStoredObject(req, res, sub) {
   const name = req.params.name;
   if (!/^[a-f0-9]{32}\.[a-z0-9]+$/i.test(name)) return fail(res, 404, "Fichier introuvable.");
-  try {
-    const result = await r2.send(new GetObjectCommand({
-      Bucket: r2Env.bucket,
-      Key: `${sub}/${name}`,
-      ...(req.headers.range && { Range: req.headers.range }),
-    }));
-    res.set("Cache-Control", "public, max-age=3600");
-    res.set("Accept-Ranges", "bytes");
-    if (result.ContentType) res.set("Content-Type", result.ContentType);
-    if (result.ContentLength !== undefined) res.set("Content-Length", String(result.ContentLength));
-    if (result.ContentRange) {
-      res.status(206);
-      res.set("Content-Range", result.ContentRange);
+  const objectKey = `${sub}/${name}`;
+  const file = await MediaFile.findByPk(objectKey);
+  if (!file) return fail(res, 404, "Fichier introuvable.");
+  const size = file.data.length;
+  let start = 0;
+  let end = size - 1;
+  if (req.headers.range) {
+    const match = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range);
+    if (!match || (!match[1] && !match[2])) {
+      res.set("Content-Range", `bytes */${size}`);
+      return fail(res, 416, "Plage de lecture invalide.");
     }
-    if (!result.Body) throw new Error("R2 a renvoyé un objet sans contenu.");
-    await pipeline(result.Body, res);
-  } catch (err) {
-    if (err.name === "NoSuchKey" || err.$metadata?.httpStatusCode === 404) {
-      return fail(res, 404, "Fichier introuvable.");
+    if (!match[1]) {
+      const suffixLength = Number(match[2]);
+      start = Math.max(size - suffixLength, 0);
+    } else {
+      start = Number(match[1]);
+      if (match[2]) end = Number(match[2]);
     }
-    if (err.$metadata?.httpStatusCode === 416) return fail(res, 416, "Plage de lecture invalide.");
-    throw err;
+    if (start >= size || start > end) {
+      res.set("Content-Range", `bytes */${size}`);
+      return fail(res, 416, "Plage de lecture invalide.");
+    }
+    end = Math.min(end, size - 1);
+    res.status(206);
+    res.set("Content-Range", `bytes ${start}-${end}/${size}`);
   }
+  const data = file.data.subarray(start, end + 1);
+  res.set("Cache-Control", "public, max-age=3600");
+  res.set("Accept-Ranges", "bytes");
+  res.set("Content-Type", file.contentType);
+  res.set("Content-Length", String(data.length));
+  res.end(data);
 }
 
 /** Limite le nombre de requêtes par adresse IP (protège les notes contre les abus). */
@@ -255,7 +248,7 @@ const app = express();
 app.set("trust proxy", true);
 app.use(express.json());
 app.use(cookieParser());
-if (r2) {
+if (cfg.db.fileStorage) {
   app.get("/media/audio/:name", (req, res) => serveStoredObject(req, res, "audio"));
   app.get("/media/covers/:name", (req, res) => serveStoredObject(req, res, "covers"));
 } else {
@@ -347,7 +340,7 @@ app.post("/api/admin/tracks", requireAdmin, audioUpload.array("files", 50), asyn
       meta = await parseFile(file.path, { duration: true });
       if (!meta.format.duration) throw new Error("pas de durée : ce n'est pas un vrai fichier audio");
     } catch {
-      if (r2) await fs.promises.rm(file.path, { force: true });
+      if (cfg.db.fileStorage) await fs.promises.rm(file.path, { force: true });
       else await removeFile("audio", file.filename);
       errors.push({ file: shown, error: "Fichier audio illisible ou corrompu." });
       continue;
@@ -355,11 +348,11 @@ app.post("/api/admin/tracks", requireAdmin, audioUpload.array("files", 50), asyn
 
     let coverFile = null;
     try {
-      await storeObject("audio", file.filename, fs.createReadStream(file.path), file.mimetype, file.size);
+      await storeObject("audio", file.filename, file.path, file.mimetype);
       const picture = meta.common.picture?.[0];
       if (picture) {
         coverFile = randomName(picture.format.includes("png") ? ".png" : ".jpg");
-        await storeObject("covers", coverFile, picture.data, picture.format, picture.data.length);
+        await storeObject("covers", coverFile, picture.data, picture.format);
       }
       created.push(await Track.create({
         title: (meta.common.title || path.parse(shown).name.replace(/_/g, " ")).trim().slice(0, 200),
@@ -371,7 +364,7 @@ app.post("/api/admin/tracks", requireAdmin, audioUpload.array("files", 50), asyn
       if (coverFile) await removeFile("covers", coverFile);
       throw err;
     } finally {
-      if (r2) await fs.promises.rm(file.path, { force: true });
+      if (cfg.db.fileStorage) await fs.promises.rm(file.path, { force: true });
     }
   }
   res.json({ created: await serialize(created, null), errors });
@@ -398,19 +391,19 @@ app.post("/api/admin/tracks/:id/cover", requireAdmin, coverUpload.single("file")
   if (!req.file) return fail(res, 400, req.rejected?.[0]?.error || "Aucune image reçue.");
   const track = await Track.findByPk(req.params.id);
   if (!track) {
-    if (r2) await fs.promises.rm(req.file.path, { force: true });
+    if (cfg.db.fileStorage) await fs.promises.rm(req.file.path, { force: true });
     else await removeFile("covers", req.file.filename);
     return fail(res, 404, "Titre introuvable.");
   }
   const previousCover = track.coverFile;
   try {
-    await storeObject("covers", req.file.filename, fs.createReadStream(req.file.path), req.file.mimetype, req.file.size);
+    await storeObject("covers", req.file.filename, req.file.path, req.file.mimetype);
     await track.update({ coverFile: req.file.filename });
   } catch (err) {
     await removeFile("covers", req.file.filename);
     throw err;
   } finally {
-    if (r2) await fs.promises.rm(req.file.path, { force: true });
+    if (cfg.db.fileStorage) await fs.promises.rm(req.file.path, { force: true });
   }
   await removeFile("covers", previousCover);
   res.json((await serialize([track], null))[0]);
