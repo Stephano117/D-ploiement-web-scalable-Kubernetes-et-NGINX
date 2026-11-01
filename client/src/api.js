@@ -37,8 +37,16 @@ export const api = {
     const data = await request("/api/admin/login", json("POST", { email, password }));
     setToken(data.access_token);
   },
+  me: () => request("/api/admin/me", {}, true),
+  accounts: () => request("/api/admin/accounts", {}, true),
+  createAccount: (email, password) => request("/api/admin/accounts", json("POST", { email, password }), true),
+  updateAccount: (id, patch) => request(`/api/admin/accounts/${id}`, json("PATCH", patch), true),
   adminTracks: () => request("/api/admin/tracks", {}, true),
+  archivedTracks: () => request("/api/admin/tracks/archived", {}, true),
   adminStorage: () => request("/api/admin/storage", {}, true),
+  archive: (id) => request(`/api/admin/tracks/${id}/archive`, { method: "POST" }, true),
+  restore: (id) => request(`/api/admin/tracks/${id}/restore`, { method: "POST" }, true),
+  permanentlyDelete: (id, title, password) => request(`/api/admin/tracks/${id}`, json("DELETE", { title, password }), true),
   update: (id, patch) => request(`/api/admin/tracks/${id}`, json("PATCH", patch), true),
   cover(id, file) {
     const body = new FormData();

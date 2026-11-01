@@ -1,5 +1,5 @@
 // Site public : les visiteurs écoutent et notent les titres de RGM.
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api.js";
 
 // ======================================================= Infos du studio (à modifier ici)
@@ -56,6 +56,7 @@ const NextIcon = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="cur
 export default function Public() {
   const audioRef = useRef(null);
   const [tracks, setTracks] = useState(null);       // null = chargement
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [tab, setTab] = useState("titres");
   const [query, setQuery] = useState("");
@@ -74,9 +75,15 @@ export default function Public() {
   const [dur, setDur] = useState(0);
   const [volume, setVolume] = useState(0.8);
 
-  useEffect(() => {
-    api.tracks().then(setTracks).catch(() => setError("Impossible de charger les titres pour le moment."));
+  const loadTracks = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    try { setTracks(await api.tracks()); }
+    catch { setError("Impossible de charger les titres pour le moment."); }
+    finally { setLoading(false); }
   }, []);
+
+  useEffect(() => { loadTracks(); }, [loadTracks]);
 
   useEffect(() => {
     localStorage.setItem("rgm_favorites", JSON.stringify(favorites));
@@ -140,13 +147,13 @@ export default function Public() {
           <span>RGM <small>REAL GHETTO MAN</small></span>
         </a>
         <nav className="side-nav" aria-label="Bibliothèque">
-          <button className={tab === "titres" ? "active" : ""} onClick={() => setTab("titres")}>
+          <button aria-pressed={tab === "titres"} className={tab === "titres" ? "active" : ""} onClick={() => setTab("titres")}>
             <span aria-hidden="true">⌂</span> Accueil
           </button>
-          <button className={tab === "favoris" ? "active" : ""} onClick={() => setTab("favoris")}>
+          <button aria-pressed={tab === "favoris"} className={tab === "favoris" ? "active" : ""} onClick={() => setTab("favoris")}>
             <span aria-hidden="true">♥</span> Titres likés <small>{favorites.length}</small>
           </button>
-          <button className={tab === "apropos" ? "active" : ""} onClick={() => setTab("apropos")}>
+          <button aria-pressed={tab === "apropos"} className={tab === "apropos" ? "active" : ""} onClick={() => setTab("apropos")}>
             <span aria-hidden="true">ⓘ</span> À propos
           </button>
         </nav>
@@ -180,10 +187,10 @@ export default function Public() {
             <>
               <section className="welcome">
                 <p className="eyebrow">VOTRE MUSIQUE, VOTRE ESPACE</p>
-                <h1>{tab === "favoris" ? "Vos titres likés" : "Le Vivre au moment present"}</h1>
+                <h1>{tab === "favoris" ? "Vos titres likés" : "Le son RGM, en libre écoute"}</h1>
                 <p>{tab === "favoris" ? "Retrouvez ici les morceaux que vous aimez." : STUDIO.tagline}</p>
               </section>
-              {error && <p className="notice" role="alert">{error}</p>}
+              {error && <div className="notice" role="alert"><span>{error}</span><button className="btn" type="button" onClick={loadTracks}>Réessayer</button></div>}
               <div className="section-heading">
                 <div>
                   <h2>{tab === "favoris" ? "Votre bibliothèque" : "Tous les titres"}</h2>
@@ -197,7 +204,7 @@ export default function Public() {
                   </select>
                 </label>
               </div>
-              {tracks === null && !error && <p className="muted">Chargement des titres...</p>}
+              {loading && <p className="muted" role="status">Chargement des titres...</p>}
               {tracks && !tracks.length && <p className="empty-state">Aucun titre pour le moment. Revenez bientôt.</p>}
               {tracks?.length > 0 && !list.length && (
                 <p className="empty-state">
@@ -212,7 +219,7 @@ export default function Public() {
                     const on = t.id === currentId;
                     const liked = favorites.includes(t.id);
                     return (
-                      <li key={t.id} className={`row ${on ? "on" : ""}`} onClick={() => playTrack(t)}>
+                      <li key={t.id} className={`row ${on ? "on" : ""}`}>
                         <span className="track-index">{on && playing ? <span className="playing-bars">▮▮</span> : i + 1}</span>
                         <button className="play" aria-label={on && playing ? `Pause ${t.title}` : `Lire ${t.title}`}
                           onClick={(e) => { e.stopPropagation(); playTrack(t); }}>

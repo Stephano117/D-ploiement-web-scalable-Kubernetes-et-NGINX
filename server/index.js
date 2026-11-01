@@ -61,10 +61,11 @@ const sequelize = new Sequelize(cfg.db.name, cfg.db.user, cfg.db.password, {
 const { STRING, FLOAT, INTEGER, BOOLEAN } = DataTypes;
 const MEDIA_STORAGE_LIMIT_BYTES = 4 * 1024 ** 3;
 
-/** Compte unique du studio. Son email et son mot de passe viennent toujours du .env. */
+/** Comptes de studio. Les mots de passe sont stockés sous forme de hash. */
 const Admin = sequelize.define("Admin", {
   email: { type: STRING(255), allowNull: false, unique: true },
   passwordHash: { type: STRING(255), allowNull: false },
+  isActive: { type: BOOLEAN, allowNull: false, defaultValue: true },
 }, { tableName: "admins", timestamps: false });
 
 /** Un titre publié (ou en brouillon) par le studio. */
@@ -77,6 +78,7 @@ const Track = sequelize.define("Track", {
   duration: { type: FLOAT, defaultValue: 0 },
   plays: { type: INTEGER, defaultValue: 0 },
   published: { type: BOOLEAN, defaultValue: true },
+  archivedAt: { type: DataTypes.DATE, allowNull: true, defaultValue: null },
 }, { tableName: "tracks" });
 
 /** Note de 1 à 5. Un visiteur (reconnu par cookie) = une note par titre. */
@@ -111,15 +113,22 @@ async function ensureDatabase() {
 }
 
 async function ensureAdmin() {
-  const [admin] = await Admin.findOrCreate({
-    where: { id: 1 },
-    defaults: { email: cfg.adminEmail, passwordHash: await bcrypt.hash(cfg.adminPassword, 10) },
-  });
-  const same = admin.email === cfg.adminEmail && (await bcrypt.compare(cfg.adminPassword, admin.passwordHash));
-  if (!same) {
-    admin.email = cfg.adminEmail;
-    admin.passwordHash = await bcrypt.hash(cfg.adminPassword, 10);
-    await admin.save();
+  const [adminColumns, trackColumns] = await Promise.all([
+    sequelize.query("SHOW COLUMNS FROM admins LIKE 'isActive'"),
+    sequelize.query("SHOW COLUMNS FROM tracks LIKE 'archivedAt'"),
+  ]);
+  if (!adminColumns[0].length) {
+    await sequelize.query("ALTER TABLE admins ADD COLUMN isActive TINYINT(1) NOT NULL DEFAULT 1");
+  }
+  if (!trackColumns[0].length) {
+    await sequelize.query("ALTER TABLE tracks ADD COLUMN archivedAt DATETIME NULL");
+  }
+  if (await Admin.count() === 0) {
+    await Admin.create({
+      email: cfg.adminEmail,
+      passwordHash: await bcrypt.hash(cfg.adminPassword, 10),
+      isActive: true,
+    });
   }
 }
 
@@ -270,11 +279,11 @@ app.get("/api/health", (req, res) => res.json({ status: "ok" }));
 
 async function publishedTrack(id) {
   const track = await Track.findByPk(id);
-  return track?.published ? track : null;
+  return track?.published && !track.archivedAt ? track : null;
 }
 
 app.get("/api/tracks", async (req, res) => {
-  const tracks = await Track.findAll({ where: { published: true }, order: newest });
+  const tracks = await Track.findAll({ where: { published: true, archivedAt: null }, order: newest });
   res.json(await serialize(tracks, req.cookies[VISITOR_COOKIE]));
 });
 
@@ -317,7 +326,7 @@ app.post("/api/admin/login", async (req, res) => {
   if (tooManyFails(req.ip)) return fail(res, 429, "Trop d'essais. Réessayez dans 15 minutes.");
   const { email = "", password = "" } = req.body || {};
   const admin = await Admin.findOne({ where: { email: String(email).trim().toLowerCase() } });
-  if (!admin || !(await bcrypt.compare(String(password), admin.passwordHash))) {
+  if (!admin || !admin.isActive || !(await bcrypt.compare(String(password), admin.passwordHash))) {
     loginFails.get(req.ip).push(Date.now());
     return fail(res, 401, "Email ou mot de passe incorrect.");
   }
@@ -329,13 +338,62 @@ app.post("/api/admin/login", async (req, res) => {
 async function requireAdmin(req, res, next) {
   try {
     const data = jwt.verify((req.headers.authorization || "").replace(/^Bearer /, ""), cfg.secret);
-    if (await Admin.findByPk(data.sub)) return next();
+    const admin = await Admin.findByPk(data.sub);
+    if (admin?.isActive) {
+      req.admin = admin;
+      return next();
+    }
   } catch { /* jeton absent ou invalide */ }
   fail(res, 401, "Session expirée, reconnectez-vous.");
 }
 
+app.get("/api/admin/accounts", requireAdmin, async (req, res) => {
+  res.json(await Admin.findAll({ attributes: ["id", "email", "isActive"], order: [["id", "ASC"]] }));
+});
+
+app.get("/api/admin/me", requireAdmin, async (req, res) => {
+  res.json({ id: req.admin.id, email: req.admin.email });
+});
+
+app.post("/api/admin/accounts", requireAdmin, async (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  const password = String(req.body?.password || "");
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return fail(res, 422, "Adresse e-mail invalide.");
+  if (password.length < 12) return fail(res, 422, "Le mot de passe doit contenir au moins 12 caractères.");
+  if (await Admin.count() >= 10) return fail(res, 409, "La limite de 10 comptes administrateur est atteinte.");
+  if (await Admin.findOne({ where: { email } })) return fail(res, 409, "Cette adresse e-mail possède déjà un compte.");
+  const admin = await Admin.create({ email, passwordHash: await bcrypt.hash(password, 12), isActive: true });
+  res.status(201).json({ id: admin.id, email: admin.email, isActive: admin.isActive });
+});
+
+app.patch("/api/admin/accounts/:id", requireAdmin, async (req, res) => {
+  const admin = await Admin.findByPk(req.params.id);
+  if (!admin) return fail(res, 404, "Compte administrateur introuvable.");
+  if (req.body?.password !== undefined) {
+    if (typeof req.body.password !== "string" || req.body.password.length < 12) {
+      return fail(res, 422, "Le mot de passe doit contenir au moins 12 caractères.");
+    }
+    admin.passwordHash = await bcrypt.hash(req.body.password, 12);
+  }
+  if (req.body?.isActive !== undefined) {
+    if (typeof req.body.isActive !== "boolean") return fail(res, 422, "État du compte invalide.");
+    if (!req.body.isActive && await Admin.count({ where: { isActive: true } }) <= 1) {
+      return fail(res, 409, "Impossible de désactiver le dernier compte administrateur actif.");
+    }
+    admin.isActive = req.body.isActive;
+  }
+  await admin.save();
+  res.json({ id: admin.id, email: admin.email, isActive: admin.isActive });
+});
+
 app.get("/api/admin/tracks", requireAdmin, async (req, res) => {
-  res.json(await serialize(await Track.findAll({ order: newest }), null));
+  res.json(await serialize(await Track.findAll({ where: { archivedAt: null }, order: newest }), null));
+});
+
+app.get("/api/admin/tracks/archived", requireAdmin, async (req, res) => {
+  res.json(await serialize(await Track.findAll({
+    where: { archivedAt: { [Sequelize.Op.ne]: null } }, order: newest,
+  }), null));
 });
 
 app.get("/api/admin/storage", requireAdmin, async (req, res) => {
@@ -407,7 +465,7 @@ app.post("/api/admin/tracks", requireAdmin, audioUpload.array("files", 50), asyn
 
 app.patch("/api/admin/tracks/:id", requireAdmin, async (req, res) => {
   const track = await Track.findByPk(req.params.id);
-  if (!track) return fail(res, 404, "Titre introuvable.");
+  if (!track || track.archivedAt) return fail(res, 404, "Titre introuvable.");
   const { title, album, published } = req.body || {};
   if (title !== undefined) {
     if (typeof title !== "string" || !title.trim() || title.length > 200) return fail(res, 422, "Titre invalide.");
@@ -422,10 +480,48 @@ app.patch("/api/admin/tracks/:id", requireAdmin, async (req, res) => {
   res.json((await serialize([track], null))[0]);
 });
 
+app.post("/api/admin/tracks/:id/archive", requireAdmin, async (req, res) => {
+  const track = await Track.findByPk(req.params.id);
+  if (!track || track.archivedAt) return fail(res, 404, "Titre introuvable.");
+  await track.update({ archivedAt: new Date() });
+  res.json({ archived: track.id });
+});
+
+app.post("/api/admin/tracks/:id/restore", requireAdmin, async (req, res) => {
+  const track = await Track.findByPk(req.params.id);
+  if (!track?.archivedAt) return fail(res, 404, "Titre archivé introuvable.");
+  await track.update({ archivedAt: null });
+  res.json((await serialize([track], null))[0]);
+});
+
+app.delete("/api/admin/tracks/:id", requireAdmin, async (req, res) => {
+  const track = await Track.findByPk(req.params.id);
+  if (!track?.archivedAt) return fail(res, 409, "Archivez d'abord le morceau avant toute suppression définitive.");
+  if (req.body?.title !== track.title) return fail(res, 422, "Le titre saisi ne correspond pas au morceau.");
+  if (!(await bcrypt.compare(String(req.body?.password || ""), req.admin.passwordHash))) {
+    return fail(res, 401, "Mot de passe administrateur incorrect.");
+  }
+  await sequelize.transaction(async (transaction) => {
+    await Rating.destroy({ where: { trackId: track.id }, transaction });
+    if (cfg.db.fileStorage) {
+      await MediaFile.destroy({
+        where: { objectKey: [`audio/${track.audioFile}`, ...(track.coverFile ? [`covers/${track.coverFile}`] : [])] },
+        transaction,
+      });
+    }
+    await track.destroy({ transaction });
+  });
+  if (!cfg.db.fileStorage) {
+    await removeFile("audio", track.audioFile);
+    await removeFile("covers", track.coverFile);
+  }
+  res.json({ deleted: track.id });
+});
+
 app.post("/api/admin/tracks/:id/cover", requireAdmin, coverUpload.single("file"), async (req, res) => {
   if (!req.file) return fail(res, 400, req.rejected?.[0]?.error || "Aucune image reçue.");
   const track = await Track.findByPk(req.params.id);
-  if (!track) {
+  if (!track || track.archivedAt) {
     if (cfg.db.fileStorage) await fs.promises.rm(req.file.path, { force: true });
     else await removeFile("covers", req.file.filename);
     return fail(res, 404, "Titre introuvable.");

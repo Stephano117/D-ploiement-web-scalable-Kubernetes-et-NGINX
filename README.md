@@ -80,11 +80,19 @@ l'application affiche l'espace occupé par les fichiers dans `/admin`, avertit q
 4 Gio et refuse un nouvel import qui dépasserait cette réserve. Les 1 Gio restants sont réservés
 aux tables et aux autres données de la base. TiDB reste la référence pour le quota réel.
 
-Aucun morceau ni fichier média n'est supprimé automatiquement pour libérer de l'espace. L'interface
-d'administration ne propose pas de suppression de titres ; remplacer une pochette conserve aussi
-l'ancienne image dans la base. Quand la réserve est atteinte, les nouveaux imports sont refusés et
-les morceaux déjà stockés restent en place. Les données et les quotas des fournisseurs peuvent
-évoluer : surveiller également l'utilisation affichée dans TiDB Cloud.
+Aucun morceau ni fichier média n'est supprimé automatiquement pour libérer de l'espace. Dans
+l'administration, archiver masque un morceau du site public mais permet de le restaurer plus tard ;
+les fichiers audio, les pochettes et les notes sont conservés. Quand la réserve est atteinte, les
+nouveaux imports sont refusés et les morceaux déjà stockés restent en place. Les données et les
+quotas des fournisseurs peuvent évoluer : surveiller également l'utilisation affichée dans TiDB Cloud.
+Une suppression définitive n'est possible que depuis les archives, après saisie exacte du titre et
+confirmation du mot de passe administrateur.
+
+L'accès admin accepte plusieurs comptes. Un administrateur connecté peut créer des comptes (mot de
+passe d'au moins 12 caractères), désactiver les anciens comptes et changer son propre mot de passe.
+L'inscription est privée : aucun compte n'est créé depuis la page de connexion. Conserver les
+identifiants en lieu sûr et ne pas les envoyer dans le dépôt. `ADMIN_EMAIL` et `ADMIN_PASSWORD`
+servent à créer le premier compte seulement ; les comptes suivants se gèrent depuis `/admin`.
 
 Le stockage des morceaux et des pochettes utilise les opérations et l'espace du quota TiDB. Le mode
 local par défaut (`FILE_STORAGE=local`) reste adapté au développement avec XAMPP.

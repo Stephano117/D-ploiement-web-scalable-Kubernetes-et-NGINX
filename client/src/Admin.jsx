@@ -43,10 +43,15 @@ function Login({ onDone }) {
 }
 
 // ======================================================= Ligne d'un titre
-function TrackRow({ track, onChange, onError }) {
+function TrackRow({ track, archived, onChange, onArchive, onRestore, onDelete, onError }) {
   const [title, setTitle] = useState(track.title);
   const [album, setAlbum] = useState(track.album);
   const [published, setPublished] = useState(track.published);
+  const [confirmingArchive, setConfirmingArchive] = useState(false);
+  const [confirmTitle, setConfirmTitle] = useState("");
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [deleteTitle, setDeleteTitle] = useState("");
+  const [deletePassword, setDeletePassword] = useState("");
   const coverInput = useRef(null);
 
   useEffect(() => setPublished(track.published), [track.published]);
@@ -75,11 +80,45 @@ function TrackRow({ track, onChange, onError }) {
         <span>{track.plays} écoute{track.plays > 1 ? "s" : ""}</span>
         <span>{track.rating_count ? `★ ${String(track.rating_avg).replace(".", ",")} (${track.rating_count})` : "Pas de note"}</span>
       </div>
-      <label className="switch">
-        <input type="checkbox" checked={published}
-          onChange={(e) => { setPublished(e.target.checked); save({ published: e.target.checked }); }} />
-        <span>{published ? "Publié" : "Brouillon"}</span>
-      </label>
+      {archived ? <span className="archive-status">Archivé · fichiers conservés</span> : (
+        <label className="switch">
+          <input type="checkbox" checked={published}
+            onChange={(e) => { setPublished(e.target.checked); save({ published: e.target.checked }); }} />
+          <span>{published ? "Publié" : "Brouillon"}</span>
+        </label>
+      )}
+      {archived ? (
+        <div className="track-actions">
+          <button className="btn" type="button" onClick={() => onRestore(track)}>Restaurer</button>
+          <button className="btn danger" type="button" onClick={() => setConfirmingDelete(true)}>Supprimer…</button>
+        </div>
+      ) : confirmingArchive ? (
+        <div className="archive-confirm">
+          <label>
+            Saisissez « {track.title} » pour confirmer
+            <input autoFocus value={confirmTitle} onChange={(e) => setConfirmTitle(e.target.value)} />
+          </label>
+          <button className="btn danger" type="button" disabled={confirmTitle !== track.title}
+            onClick={() => onArchive(track)}>Archiver</button>
+          <button className="btn" type="button" onClick={() => { setConfirmingArchive(false); setConfirmTitle(""); }}>Annuler</button>
+        </div>
+      ) : (
+        <button className="btn danger" type="button" onClick={() => setConfirmingArchive(true)}>Archiver</button>
+      )}
+      {confirmingDelete && archived && (
+        <div className="archive-confirm permanent-delete" role="group" aria-label={`Suppression définitive de ${track.title}`}>
+          <p>Suppression définitive : le fichier audio, la pochette et les notes seront effacés.</p>
+          <label>Saisissez « {track.title} »
+            <input autoFocus value={deleteTitle} onChange={(e) => setDeleteTitle(e.target.value)} />
+          </label>
+          <label>Confirmez votre mot de passe admin
+            <input type="password" autoComplete="current-password" value={deletePassword} onChange={(e) => setDeletePassword(e.target.value)} />
+          </label>
+          <button className="btn danger" type="button" disabled={deleteTitle !== track.title || !deletePassword}
+            onClick={() => onDelete(track, deletePassword)}>Supprimer définitivement</button>
+          <button className="btn" type="button" onClick={() => { setConfirmingDelete(false); setDeleteTitle(""); setDeletePassword(""); }}>Annuler</button>
+        </div>
+      )}
     </li>
   );
 }
@@ -88,18 +127,30 @@ function TrackRow({ track, onChange, onError }) {
 export default function Admin() {
   const [logged, setLogged] = useState(Boolean(getToken()));
   const [tracks, setTracks] = useState(null);
+  const [archivedTracks, setArchivedTracks] = useState([]);
+  const [accounts, setAccounts] = useState([]);
+  const [currentAdmin, setCurrentAdmin] = useState(null);
   const [storage, setStorage] = useState(null);
+  const [section, setSection] = useState("overview");
+  const [query, setQuery] = useState("");
   const [message, setMessage] = useState(null);   // { text, ok }
   const [progress, setProgress] = useState(null);   // null = pas d'envoi en cours
   const [over, setOver] = useState(false);
+  const [accountEmail, setAccountEmail] = useState("");
+  const [accountPassword, setAccountPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [busy, setBusy] = useState(false);
   const fileInput = useRef(null);
 
-  const logout = useCallback(() => { setToken(null); setLogged(false); setTracks(null); }, []);
+  const logout = useCallback(() => { setToken(null); setLogged(false); setTracks(null); setCurrentAdmin(null); }, []);
   const fail = useCallback((e) => (e.status === 401 ? logout() : setMessage({ text: e.message })), [logout]);
 
-  const load = useCallback(() => {
+  const load = useCallback(async () => {
     api.adminTracks().then(setTracks).catch(fail);
     api.adminStorage().then(setStorage).catch(fail);
+    api.archivedTracks().then(setArchivedTracks).catch(fail);
+    api.accounts().then(setAccounts).catch(fail);
+    api.me().then(setCurrentAdmin).catch(fail);
   }, [fail]);
 
   useEffect(() => { if (logged) load(); }, [logged, load]);
@@ -122,59 +173,169 @@ export default function Admin() {
     }
   }
 
+  async function archiveTrack(track) {
+    try {
+      await api.archive(track.id);
+      setTracks((all) => all.filter((item) => item.id !== track.id));
+      setArchivedTracks((all) => [{ ...track, archivedAt: new Date().toISOString() }, ...all]);
+      setMessage({ ok: true, text: `« ${track.title} » a été archivé. Vous pouvez le restaurer à tout moment.` });
+    } catch (e) { fail(e); }
+  }
+
+  async function restoreTrack(track) {
+    try {
+      const restored = await api.restore(track.id);
+      setArchivedTracks((all) => all.filter((item) => item.id !== track.id));
+      setTracks((all) => [restored, ...all]);
+      setMessage({ ok: true, text: `« ${track.title} » a été restauré.` });
+    } catch (e) { fail(e); }
+  }
+
+  async function deleteTrack(track, password) {
+    try {
+      await api.permanentlyDelete(track.id, track.title, password);
+      setArchivedTracks((all) => all.filter((item) => item.id !== track.id));
+      setMessage({ ok: true, text: `« ${track.title} » et ses fichiers ont été supprimés définitivement.` });
+    } catch (e) { fail(e); }
+  }
+
+  async function createAccount(e) {
+    e.preventDefault();
+    setBusy(true);
+    try {
+      const account = await api.createAccount(accountEmail, accountPassword);
+      setAccounts((all) => [...all, account].sort((a, b) => a.id - b.id));
+      setAccountEmail("");
+      setAccountPassword("");
+      setMessage({ ok: true, text: `Le compte ${account.email} a été créé.` });
+    } catch (e) { fail(e); } finally { setBusy(false); }
+  }
+
+  async function deactivateAccount(account) {
+    if (!window.confirm(`Désactiver le compte ${account.email} ? Il ne pourra plus se connecter.`)) return;
+    try {
+      const updated = await api.updateAccount(account.id, { isActive: false });
+      setAccounts((all) => all.map((item) => item.id === updated.id ? updated : item));
+      setMessage({ ok: true, text: `Le compte ${account.email} a été désactivé.` });
+    } catch (e) { fail(e); }
+  }
+
+  async function changeOwnPassword(e) {
+    e.preventDefault();
+    if (!currentAdmin) return;
+    setBusy(true);
+    try {
+      await api.updateAccount(currentAdmin.id, { password: newPassword });
+      setNewPassword("");
+      setMessage({ ok: true, text: "Votre mot de passe a été modifié." });
+    } catch (e) { fail(e); } finally { setBusy(false); }
+  }
+
+  const visibleTracks = (tracks || []).filter((track) =>
+    `${track.title} ${track.artist} ${track.album}`.toLowerCase().includes(query.trim().toLowerCase()));
+
   if (!logged) return <div className="admin"><Login onDone={() => setLogged(true)} /></div>;
 
   return (
     <div className="admin">
       <header className="admin-top">
-        <strong>RGM <span>Espace studio</span></strong>
-        <div>
+        <a className="admin-brand" href="/admin"><img src="/logo.jpg" alt="" /><span>RGM<small>STUDIO</small></span></a>
+        <nav className="admin-nav" aria-label="Navigation admin">
+          {[["overview", "Vue d’ensemble"], ["tracks", "Bibliothèque"], ["archive", "Archives"], ["accounts", "Comptes"]].map(([id, label]) => (
+            <button type="button" key={id} className={section === id ? "active" : ""} onClick={() => { setSection(id); setMessage(null); }}>{label}</button>
+          ))}
+        </nav>
+        <div className="admin-actions">
+          <span className="admin-identity">{currentAdmin?.email}</span>
           <a href="/" className="btn">Voir le site</a>
-          <button className="btn" onClick={logout}>Déconnexion</button>
+          <button className="btn" type="button" onClick={logout}>Déconnexion</button>
         </div>
       </header>
 
       <main className="admin-main">
-        <label
-          className={`drop ${over ? "over" : ""}`}
-          onDragOver={(e) => { e.preventDefault(); setOver(true); }}
-          onDragLeave={() => setOver(false)}
-          onDrop={(e) => { e.preventDefault(); setOver(false); upload(e.dataTransfer.files); }}
-        >
-          <strong>Importer des musiques</strong>
-          <span>Déposez vos fichiers ici ou touchez pour les choisir (mp3, wav, flac, m4a, aac, ogg)</span>
-          <input ref={fileInput} type="file" accept="audio/*" multiple hidden onChange={(e) => upload(e.target.files)} />
-          {progress !== null && (
-            <div className="progress" role="progressbar" aria-valuenow={Math.round(progress * 100)}>
-              <div style={{ width: `${progress * 100}%` }} />
-              <small>{progress >= 1 ? "Conversion en cours..." : `${Math.round(progress * 100)} %`}</small>
-            </div>
-          )}
-        </label>
+        <section className="admin-heading">
+          <div><p className="eyebrow">ESPACE STUDIO</p><h1>{section === "overview" ? "Vue d’ensemble" : section === "tracks" ? "Bibliothèque" : section === "archive" ? "Archives" : "Comptes administrateur"}</h1></div>
+          <span className="admin-live"><i /> Service opérationnel</span>
+        </section>
 
-        {storage?.tracked && (
-          <p className={`notice ${storage.warning ? "" : "ok"}`} role={storage.warning ? "alert" : "status"}>
-            Stockage des morceaux : {fmtBytes(storage.usedBytes)} utilisés sur {fmtBytes(storage.limitBytes)}.
-            {storage.warning
-              ? " L'espace commence à se remplir. Aucun morceau ne sera supprimé automatiquement ; les nouveaux imports seront refusés si l'espace réservé est atteint."
-              : " Les morceaux importés sont conservés ; aucun nettoyage automatique n'est effectué."}
-          </p>
+        {message && <p className={`notice ${message.ok ? "ok" : ""}`} role={message.ok ? "status" : "alert"}>{message.text}</p>}
+
+        {section === "overview" && (
+          <>
+            <div className="admin-stats">
+              <article><span>Titres actifs</span><strong>{tracks?.length ?? "—"}</strong><small>Dans la bibliothèque</small></article>
+              <article><span>En archive</span><strong>{archivedTracks.length}</strong><small>Restaurables à tout moment</small></article>
+              <article><span>Comptes actifs</span><strong>{accounts.filter((a) => a.isActive).length}</strong><small>Accès studio</small></article>
+              <article><span>Stockage médias</span><strong>{storage?.tracked ? fmtBytes(storage.usedBytes) : "—"}</strong><small>Fichiers audio et pochettes</small></article>
+            </div>
+            {storage?.tracked && <div className={`storage-card ${storage.warning ? "warning" : ""}`} role={storage.warning ? "alert" : "status"}>
+              <div><strong>Stockage TiDB</strong><span>{fmtBytes(storage.usedBytes)} sur {fmtBytes(storage.limitBytes)} réservés</span></div>
+              <div className="storage-meter"><span style={{ width: `${Math.min(100, storage.usedBytes / storage.limitBytes * 100)}%` }} /></div>
+              <p>{storage.warning ? "L’espace approche de la limite. Aucun titre n’est supprimé automatiquement ; les nouveaux imports seront refusés si la réserve est atteinte." : "Les morceaux sont conservés. Aucun nettoyage automatique n’est effectué."}</p>
+            </div>}
+            <section className="admin-panel">
+              <div className="panel-title"><div><h2>Importer des morceaux</h2><p>Ajoutez des fichiers audio à votre bibliothèque.</p></div></div>
+              <label className={`drop ${over ? "over" : ""} ${storage?.importBlocked ? "disabled" : ""}`}
+                onDragOver={(e) => { e.preventDefault(); if (!storage?.importBlocked) setOver(true); }}
+                onDragLeave={() => setOver(false)}
+                onDrop={(e) => { e.preventDefault(); setOver(false); if (!storage?.importBlocked) upload(e.dataTransfer.files); }}>
+                <span className="drop-icon" aria-hidden="true">↑</span><strong>{storage?.importBlocked ? "Espace presque plein" : "Glissez vos fichiers ici"}</strong>
+                <span>ou sélectionnez sur cet appareil · MP3, WAV, FLAC, M4A, AAC, OGG · 20 Mo max.</span>
+                <input ref={fileInput} type="file" accept="audio/*" multiple hidden disabled={Boolean(storage?.importBlocked)} onChange={(e) => upload(e.target.files)} />
+                {progress !== null && <div className="progress" role="progressbar" aria-valuenow={Math.round(progress * 100)}><div style={{ width: `${progress * 100}%` }} /><small>{progress >= 1 ? "Enregistrement..." : `${Math.round(progress * 100)} %`}</small></div>}
+              </label>
+            </section>
+            <section className="admin-panel">
+              <div className="panel-title"><div><h2>Derniers morceaux</h2><p>Modifiez les informations ou gérez la publication.</p></div><button className="btn" type="button" onClick={() => setSection("tracks")}>Tout voir</button></div>
+              <TrackList tracks={(tracks || []).slice(0, 5)} query="" onChange={(u) => setTracks((all) => all.map((x) => x.id === u.id ? u : x))}
+                  onArchive={archiveTrack} onRestore={restoreTrack} onDelete={deleteTrack} onError={fail} />
+            </section>
+          </>
         )}
 
-        {message && <p className={`notice ${message.ok ? "ok" : ""}`} role="status">{message.text}</p>}
+        {(section === "tracks" || section === "archive") && (
+          <section className="admin-panel">
+            {section === "tracks" && <label className="admin-search"><span aria-hidden="true">⌕</span><input type="search" value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Rechercher un morceau…" aria-label="Rechercher un morceau" /></label>}
+            <div className="panel-title"><div><h2>{section === "tracks" ? "Tous les morceaux" : "Morceaux archivés"}</h2><p>{section === "tracks" ? `${visibleTracks.length} élément${visibleTracks.length === 1 ? "" : "s"} · archiver masque sans effacer` : "Les fichiers sont conservés ; restaurez un titre en un clic."}</p></div></div>
+            <TrackList tracks={section === "tracks" ? visibleTracks : archivedTracks} archived={section === "archive"} query={query}
+              onChange={(u) => setTracks((all) => all.map((x) => x.id === u.id ? u : x))}
+              onArchive={archiveTrack} onRestore={restoreTrack} onDelete={deleteTrack} onError={fail} />
+          </section>
+        )}
 
-        <h2>Vos titres {tracks && <small>{tracks.length}</small>}</h2>
-        {tracks === null && <p className="muted">Chargement...</p>}
-        {tracks && !tracks.length && <p className="muted">Aucun titre. Importez votre première musique ci-dessus.</p>}
-        <ul className="alist">
-          {(tracks || []).map((t) => (
-            <TrackRow
-              key={t.id} track={t} onError={fail}
-              onChange={(u) => setTracks((all) => all.map((x) => (x.id === u.id ? u : x)))}
-            />
-          ))}
-        </ul>
+        {section === "accounts" && (
+          <div className="account-layout">
+            <section className="admin-panel">
+              <div className="panel-title"><div><h2>Ajouter un administrateur</h2><p>Limite de 10 comptes. Mot de passe d’au moins 12 caractères.</p></div></div>
+              <form className="account-form" onSubmit={createAccount}>
+                <label>Adresse e-mail<input type="email" autoComplete="email" value={accountEmail} onChange={(e) => setAccountEmail(e.target.value)} required /></label>
+                <label>Mot de passe temporaire<input type="password" autoComplete="new-password" minLength={12} value={accountPassword} onChange={(e) => setAccountPassword(e.target.value)} required /></label>
+                <button className="btn primary" disabled={busy}>Créer le compte</button>
+              </form>
+            </section>
+            <section className="admin-panel">
+              <div className="panel-title"><div><h2>Accès administrateurs</h2><p>Désactivez les comptes qui ne doivent plus accéder au studio.</p></div></div>
+              <ul className="account-list">{accounts.map((account) => <li key={account.id}>
+                <span className="account-avatar">{account.email[0].toUpperCase()}</span><div><strong>{account.email}</strong><small>{account.id === currentAdmin?.id ? "Votre compte" : account.isActive ? "Accès actif" : "Désactivé"}</small></div>
+                {account.isActive && account.id !== currentAdmin?.id && <button className="btn" type="button" onClick={() => deactivateAccount(account)}>Désactiver</button>}
+              </li>)}</ul>
+            </section>
+            <section className="admin-panel">
+              <div className="panel-title"><div><h2>Changer mon mot de passe</h2><p>Choisissez une phrase secrète longue et unique.</p></div></div>
+              <form className="account-form" onSubmit={changeOwnPassword}>
+                <label>Nouveau mot de passe<input type="password" autoComplete="new-password" minLength={12} value={newPassword} onChange={(e) => setNewPassword(e.target.value)} required /></label>
+                <button className="btn" disabled={busy}>Mettre à jour</button>
+              </form>
+            </section>
+          </div>
+        )}
       </main>
     </div>
   );
+}
+
+function TrackList({ tracks, archived = false, onChange, onArchive, onRestore, onDelete, onError }) {
+  if (!tracks.length) return <p className="empty-admin">{archived ? "Aucun morceau archivé." : "Aucun morceau ici. Importez un titre pour commencer."}</p>;
+  return <ul className="alist">{tracks.map((track) => <TrackRow key={track.id} track={track} archived={archived}
+    onChange={onChange} onArchive={onArchive} onRestore={onRestore} onDelete={onDelete} onError={onError} />)}</ul>;
 }
