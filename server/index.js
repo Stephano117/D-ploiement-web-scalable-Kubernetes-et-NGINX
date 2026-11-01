@@ -155,10 +155,10 @@ const fail = (res, status, detail) => res.status(status).json({ detail });
 const randomName = (ext) => crypto.randomUUID().replaceAll("-", "") + ext;
 async function storeObject(sub, name, source, contentType) {
   if (cfg.db.fileStorage) {
-    const data = Buffer.isBuffer(source) ? source : await fs.promises.readFile(source);
+    const data = typeof source === "string" ? await fs.promises.readFile(source) : Buffer.from(source);
     await MediaFile.upsert({ objectKey: `${sub}/${name}`, contentType, data });
-  } else if (Buffer.isBuffer(source)) {
-    await fs.promises.writeFile(path.join(cfg.uploads, sub, name), source);
+  } else if (typeof source !== "string") {
+    await fs.promises.writeFile(path.join(cfg.uploads, sub, name), Buffer.from(source));
   }
 }
 
